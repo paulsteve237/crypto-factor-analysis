@@ -1,6 +1,25 @@
 # ============================================================
 # 4. FACTOR STORE
 # ============================================================
+# dataclass permet de créer facilement une classe de configuration.
+from dataclasses import dataclass
+
+# Optional, List et Dict servent à typer les arguments et retours de fonctions.
+from typing import Optional, List, Dict
+
+# Bibliothèques classiques pour les calculs numériques, les données et les graphiques.
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from statsmodels.graphics.tsaplots import plot_acf
+# yfinance permet de télécharger automatiquement les données Yahoo Finance.
+import yfinance as yf
+
+# statsmodels est utilisé ici pour faire les régressions OLS.
+import statsmodels.api as sm
+
+# PCA sert à construire des facteurs principaux à partir des rendements.
+from sklearn.decomposition import PCA
 
 class FactorStore:
     """
