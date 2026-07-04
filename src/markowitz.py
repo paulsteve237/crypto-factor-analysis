@@ -1,7 +1,6 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-!pip install arch
 try:
     from arch import arch_model
 except ImportError:
