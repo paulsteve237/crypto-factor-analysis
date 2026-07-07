@@ -1,6 +1,35 @@
+"""
+DynamicFactorNeutralMarkowitz
+=============================
+
+Ce module implémente une stratégie de portefeuille de type Markowitz dynamique
+avec contrainte de neutralité factorielle.
+
+Idée générale :
+- On dispose d'un signal alpha_t par actif.
+- On dispose éventuellement d'un terme c_t par actif.
+- On dispose de betas dynamiques par actif, c'est-à-dire les expositions aux facteurs.
+- On construit une matrice de covariance Sigma_t des résidus.
+- On choisit les poids w_t qui maximisent le signal attendu tout en neutralisant
+  les expositions factorielles : beta_t.T @ w_t ≈ 0.
+- On calibre ensuite le risque soit via une volatilité cible, soit via une aversion
+  au risque explicite.
+
+Le code accepte trois méthodes de covariance :
+1. constant : covariance empirique constante sur toute la période.
+2. rolling  : covariance glissante sur une fenêtre passée.
+3. dcc      : covariance dynamique via GARCH univariés + corrélation DCC.
+"""
+
+# NumPy sert aux calculs matriciels, produits scalaires, pseudo-inverses, etc.
 import numpy as np
+# Pandas sert à manipuler les séries temporelles : DataFrame, Series, index de dates.
 import pandas as pd
+# Matplotlib sert uniquement aux graphiques de diagnostic.
 import matplotlib.pyplot as plt
+# Le package arch est nécessaire uniquement pour la méthode DCC-GARCH.
+# Si le package n'est pas installé, on garde arch_model = None.
+# Le code continuera à fonctionner pour sigma_method="constant" ou "rolling".
 try:
     from arch import arch_model
 except ImportError:
@@ -8,18 +37,26 @@ except ImportError:
 
 
 class DynamicFactorNeutralMarkowitz:
+    """
+    Classe principale qui :
+    - construit les matrices de covariance Sigma_t ;
+    - calcule les poids factor-neutral de Markowitz ;
+    - stocke les poids, les expositions factorielles et la volatilité ex-ante ;
+    - fournit des méthodes de backtest, performance, diagnostics et graphiques.
+    """
 
     def __init__(
         self,
-        target_vol=0.02,
-        risk_aversion=None,
-        sigma_method="constant",   # "constant", "rolling", "dcc"
-        rolling_window=60,
-        dcc_a=0.03,
-        dcc_b=0.95,
-        garch_scale=100,
-        ridge=1e-8
+        target_vol=0.02,        # Volatilité cible ex-ante du portefeuille par période, ex : 0.02 = 2%.
+        risk_aversion=None,     # Si fourni, les poids sont divisés par ce lambda au lieu d'être calibrés sur target_vol.
+        sigma_method="constant",   # Méthode de covariance : "constant", "rolling" ou "dcc".
+        rolling_window=60,      # Taille de la fenêtre utilisée pour la covariance rolling.
+        dcc_a=0.03,             # Paramètre a du DCC : poids donné au choc de corrélation récent.
+        dcc_b=0.95,             # Paramètre b du DCC : persistance de la corrélation dynamique.
+        garch_scale=100,        # Facteur d'échelle pour stabiliser l'estimation GARCH sur des rendements petits.
+        ridge=1e-8              # Petite régularisation ajoutée à la diagonale de Sigma pour éviter les matrices singulières.
     ):
+        # On stocke tous les hyperparamètres dans l'objet.
         self.target_vol = target_vol
         self.risk_aversion = risk_aversion
         self.sigma_method = sigma_method
@@ -29,6 +66,7 @@ class DynamicFactorNeutralMarkowitz:
         self.garch_scale = garch_scale
         self.ridge = ridge
 
+        # Attributs remplis après fit(). Le suffixe _ indique un résultat estimé.
         self.weights_ = None
         self.factor_exposures_ = None
         self.portfolio_vol_ = None
@@ -42,6 +80,14 @@ class DynamicFactorNeutralMarkowitz:
     # ======================================================
 
     def _as_dataframe(self, x):
+        """
+        Convertit une entrée en DataFrame.
+
+        Pourquoi ?
+        - Les méthodes suivantes attendent des DataFrames avec index de dates.
+        - Si x est une Series, on la transforme en DataFrame à une seule colonne.
+        - Si x est déjà un DataFrame, on en fait une copie pour éviter de modifier l'objet original.
+        """
         if x is None:
             return None
         if isinstance(x, pd.Series):
@@ -49,11 +95,27 @@ class DynamicFactorNeutralMarkowitz:
         return x.copy()
 
     def _normalize_index(self, df):
+        """
+        Normalise l'index temporel :
+        - conversion en datetime ;
+        - tri chronologique.
+        Cela évite les problèmes d'alignement entre returns, alphas, c, betas et residuals.
+        """
         df = df.copy()
         df.index = pd.to_datetime(df.index)
         return df.sort_index()
 
     def _normalize_betas(self, betas, assets):
+        """
+        Nettoie le dictionnaire des betas.
+
+        Format attendu :
+            betas[asset] = DataFrame indexé par date
+                           colonnes = facteurs
+                           valeurs = beta de l'actif aux facteurs.
+
+        La méthode conserve uniquement les actifs présents dans assets.
+        """
         clean_betas = {}
 
         for asset in assets:
@@ -72,6 +134,10 @@ class DynamicFactorNeutralMarkowitz:
         return clean_betas
 
     def _get_common_beta_dates(self, betas):
+        """
+        Cherche les dates communes à tous les DataFrames de betas.
+        On ne peut optimiser que sur les dates où tous les actifs ont un beta disponible.
+        """
         common_dates = None
 
         for _, beta_df in betas.items():
@@ -83,6 +149,15 @@ class DynamicFactorNeutralMarkowitz:
         return common_dates
 
     def _get_beta_t(self, betas, date, assets):
+        """
+        Construit la matrice beta_t à une date donnée.
+
+        Résultat :
+            beta_t.shape = (N actifs, K facteurs)
+
+        Chaque ligne correspond à un actif.
+        Chaque colonne correspond à un facteur.
+        """
         beta_matrix = []
 
         for asset in assets:
@@ -95,6 +170,12 @@ class DynamicFactorNeutralMarkowitz:
     # ======================================================
 
     def _build_constant_sigmas(self, residuals, dates, assets):
+        """
+        Construit une covariance constante.
+
+        Sigma est calculée une seule fois à partir des résidus historiques,
+        puis la même matrice est utilisée pour toutes les dates.
+        """
         Sigma = residuals[assets].dropna().cov().values
         Sigma = Sigma + self.ridge * np.eye(len(assets))
 
@@ -104,6 +185,18 @@ class DynamicFactorNeutralMarkowitz:
         }
 
     def _build_rolling_sigmas(self, residuals, dates, assets):
+        """
+        Construit une covariance dynamique par fenêtre glissante.
+
+        À chaque date t :
+        - on prend les rolling_window observations précédentes ;
+        - on calcule leur matrice de covariance ;
+        - on ajoute une petite régularisation ridge sur la diagonale.
+
+        Attention :
+        - La covariance à la date t utilise uniquement le passé, pas la valeur de t.
+        - Les premières dates sont ignorées car il n'y a pas assez d'historique.
+        """
         residuals = residuals[assets].dropna()
 
         sigmas = {}
@@ -127,6 +220,25 @@ class DynamicFactorNeutralMarkowitz:
         return sigmas
 
     def _build_dcc_sigmas(self, residuals, dates, assets):
+        """
+        Construit des matrices Sigma_t via une approche DCC-GARCH simplifiée.
+
+        Étapes :
+        1. Pour chaque actif, on estime un GARCH(1,1) sur les résidus.
+        2. On récupère :
+           - les volatilités conditionnelles h_t^{1/2} ;
+           - les résidus standardisés z_t.
+        3. On estime une corrélation dynamique DCC :
+           Q_t = (1-a-b) Q_bar + a z_{t-1} z_{t-1}' + b Q_{t-1}
+        4. On transforme Q_t en matrice de corrélation R_t.
+        5. On reconstruit :
+           Sigma_t = D_t R_t D_t
+           avec D_t = diag(volatilités conditionnelles).
+
+        Remarque :
+        - Ce DCC utilise dcc_a et dcc_b fixés par l'utilisateur.
+        - Il ne calibre pas a et b par maximum de vraisemblance.
+        """
         if arch_model is None:
             raise ImportError(
                 "Le package arch n'est pas installé. "
@@ -206,6 +318,10 @@ class DynamicFactorNeutralMarkowitz:
         return sigmas
 
     def _build_sigmas(self, residuals, dates, assets):
+        """
+        Routeur qui choisit la méthode de construction de Sigma_t
+        selon self.sigma_method.
+        """
         residuals = self._normalize_index(self._as_dataframe(residuals))
 
         if self.sigma_method == "constant":
@@ -224,6 +340,27 @@ class DynamicFactorNeutralMarkowitz:
     # ======================================================
 
     def _compute_weights_one_date(self, alpha_t, c_t, beta_t, sigma_t):
+        """
+        Calcule les poids optimaux à une date donnée.
+
+        Objectif intuitif :
+            exploiter le signal mu_t = alpha_t + c_t
+
+        Contrainte :
+            neutralité factorielle : beta_t.T @ w_t = 0
+
+        Formule utilisée :
+            P_t = Sigma^{-1}
+                  - Sigma^{-1} B (B' Sigma^{-1} B)^{-1} B' Sigma^{-1}
+
+        P_t est le projecteur qui retire la composante exposée aux facteurs.
+        Le signal brut est :
+            raw_signal = P_t @ mu_t
+
+        Ensuite :
+        - si risk_aversion est fourni : w = raw_signal / risk_aversion
+        - sinon : les poids sont rescalés pour atteindre target_vol.
+        """
         alpha_t = np.asarray(alpha_t).reshape(-1)
         c_t = np.asarray(c_t).reshape(-1)
         beta_t = np.asarray(beta_t)
@@ -270,6 +407,22 @@ class DynamicFactorNeutralMarkowitz:
     # ======================================================
 
     def fit(self, returns, alphas, betas, residuals, c=None):
+        """
+        Méthode principale d'estimation.
+
+        Paramètres attendus :
+        - returns   : DataFrame des rendements réalisés par actif.
+        - alphas    : DataFrame des signaux alpha_t par actif.
+        - betas     : dictionnaire {asset: DataFrame de betas dynamiques}.
+        - residuals : DataFrame des résidus utilisés pour estimer Sigma_t.
+        - c         : DataFrame optionnel du terme c_t. Si absent, c_t = 0.
+
+        Résultats stockés :
+        - self.weights_           : poids optimaux par date et actif.
+        - self.factor_exposures_  : exposition factorielle beta_t.T @ w_t.
+        - self.portfolio_vol_     : volatilité ex-ante sqrt(w' Sigma w).
+        - self.sigmas_            : dictionnaire des matrices Sigma_t.
+        """
         returns = self._normalize_index(self._as_dataframe(returns))
         alphas = self._normalize_index(self._as_dataframe(alphas))
 
@@ -381,6 +534,14 @@ class DynamicFactorNeutralMarkowitz:
     # ======================================================
 
     def get_pnl(self, returns):
+        """
+        Calcule le PnL de la stratégie.
+
+        Important :
+        - Les poids w_t sont décalés d'une période avec shift(1).
+        - Cela évite le look-ahead bias :
+          le poids décidé à t-1 est appliqué au rendement réalisé à t.
+        """
         returns = self._normalize_index(self._as_dataframe(returns))
         returns = returns[self.weights_.columns]
 
@@ -395,15 +556,37 @@ class DynamicFactorNeutralMarkowitz:
         return pnl
 
     def get_cumulative_pnl(self, returns):
+        """
+        Renvoie le PnL cumulé, c'est-à-dire la somme des PnL période par période.
+        """
         return self.get_pnl(returns).cumsum().rename("cumulative_pnl")
     """
     def get_wealth(self, returns):
+        """
+        Renvoie une mesure de richesse cumulée.
+
+        Remarque importante :
+        - Ici, wealth = cumsum(PnL), donc c'est une richesse additive.
+        - Si le PnL est un rendement de portefeuille, la richesse classique serait :
+              (1 + pnl).cumprod()
+        """
         return (1 + self.get_pnl(returns)).cumprod().rename("wealth")
     """
     def get_wealth(self, returns):
         return (self.get_pnl(returns)).cumsum().rename("wealth")
 
     def backtest(self, returns):
+        """
+        Produit un DataFrame simple de backtest avec :
+        - pnl ;
+        - cumulative_pnl ;
+        - wealth.
+
+        Attention :
+        - Dans le code actuel, wealth = pnl.cumprod(), ce qui est inhabituel
+          si pnl contient des rendements.
+        - Pour des rendements, on utilise généralement (1 + pnl).cumprod().
+        """
         pnl = self.get_pnl(returns)
 
         return pd.DataFrame({
@@ -414,6 +597,12 @@ class DynamicFactorNeutralMarkowitz:
         })
 
     def performance(self, returns, periods_per_year=252):
+        """
+        Calcule quelques métriques de performance annualisées.
+
+        periods_per_year=252 correspond aux marchés actions quotidiens.
+        Pour les cryptos, on peut plutôt utiliser 365 si les données sont journalières.
+        """
         pnl = self.get_pnl(returns)
         #wealth = (1 + pnl).cumprod()
         wealth = (pnl).cumprod()
@@ -436,6 +625,14 @@ class DynamicFactorNeutralMarkowitz:
     # ======================================================
 
     def check_neutrality(self, betas, date=None):
+        """
+        Vérifie la neutralité factorielle à une date donnée.
+
+        Renvoie :
+            beta_t.T @ w_t
+
+        Si la neutralité est bien respectée, les valeurs doivent être proches de zéro.
+        """
         if date is None:
             date = self.used_dates_[0]
 
@@ -455,6 +652,10 @@ class DynamicFactorNeutralMarkowitz:
         )
 
     def get_sigma(self, date):
+        """
+        Renvoie la matrice Sigma_t à une date donnée sous forme de DataFrame,
+        avec les noms des actifs en lignes et en colonnes.
+        """
         date = pd.Timestamp(date)
 
         return pd.DataFrame(
@@ -463,6 +664,10 @@ class DynamicFactorNeutralMarkowitz:
             columns=self.assets_
         )
     def get_variance_series(self, asset):
+        """
+        Extrait la variance dynamique Sigma_t[i, i] d'un actif donné.
+        Utile pour tracer l'évolution du risque idiosyncratique d'un actif.
+        """
         i = self.assets_.index(asset)
 
         return pd.Series(
@@ -475,12 +680,19 @@ class DynamicFactorNeutralMarkowitz:
 
 
     def get_volatility_series(self, asset):
+        """
+        Extrait la volatilité dynamique d'un actif :
+            volatilité = sqrt(variance)
+        """
         return np.sqrt(
             self.get_variance_series(asset)
         ).rename(f"volatility_{asset}")
 
 
     def get_covariance_series(self, asset_i, asset_j):
+        """
+        Extrait la covariance dynamique Sigma_t[i, j] entre deux actifs.
+        """
         i = self.assets_.index(asset_i)
         j = self.assets_.index(asset_j)
 
@@ -494,6 +706,11 @@ class DynamicFactorNeutralMarkowitz:
 
 
     def get_correlation_series(self, asset_i, asset_j):
+        """
+        Extrait la corrélation dynamique entre deux actifs :
+
+            corr_ij,t = Sigma_ij,t / sqrt(Sigma_ii,t * Sigma_jj,t)
+        """
         i = self.assets_.index(asset_i)
         j = self.assets_.index(asset_j)
 
@@ -510,24 +727,37 @@ class DynamicFactorNeutralMarkowitz:
     # ======================================================
 
     def plot_weights(self):
+        """
+        Trace les poids dynamiques par actif.
+        """
         self.weights_.plot(figsize=(12, 5))
         plt.title("Poids dynamiques")
         plt.axhline(0)
         plt.show()
 
     def plot_factor_exposures(self):
+        """
+        Trace les expositions factorielles du portefeuille.
+        Elles doivent idéalement rester proches de zéro.
+        """
         self.factor_exposures_.plot(figsize=(12, 5))
         plt.title("Expositions factorielles")
         plt.axhline(0)
         plt.show()
 
     def plot_portfolio_vol(self):
+        """
+        Trace la volatilité ex-ante du portefeuille et la compare à target_vol.
+        """
         self.portfolio_vol_.plot(figsize=(12, 5))
         plt.title("Volatilité ex-ante")
         plt.axhline(self.target_vol, linestyle="--")
         plt.show()
 
     def plot_wealth(self, returns):
+        """
+        Trace la richesse cumulée renvoyée par get_wealth().
+        """
         self.get_wealth(returns).plot(figsize=(12, 5))
         plt.title("Richesse cumulée")
         plt.show()
