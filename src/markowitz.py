@@ -562,14 +562,14 @@ class DynamicFactorNeutralMarkowitz:
         return self.get_pnl(returns).cumsum().rename("cumulative_pnl")
     """
     def get_wealth(self, returns):
-        """
+      
         Renvoie une mesure de richesse cumulée.
 
         Remarque importante :
         - Ici, wealth = cumsum(PnL), donc c'est une richesse additive.
         - Si le PnL est un rendement de portefeuille, la richesse classique serait :
               (1 + pnl).cumprod()
-        """
+       
         return (1 + self.get_pnl(returns)).cumprod().rename("wealth")
     """
     def get_wealth(self, returns):
