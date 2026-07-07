@@ -463,15 +463,15 @@ class DynamicFactorNeutralMarkowitz:
             columns=self.assets_
         )
     def get_variance_series(self, asset):
-    i = self.assets_.index(asset)
+        i = self.assets_.index(asset)
 
-    return pd.Series(
-        {
-            date: Sigma[i, i]
-            for date, Sigma in self.sigmas_.items()
-        },
-        name=f"variance_{asset}"
-    ).sort_index()
+        return pd.Series(
+            {
+                date: Sigma[i, i]
+                for date, Sigma in self.sigmas_.items()
+            },
+            name=f"variance_{asset}"
+        ).sort_index()
 
 
     def get_volatility_series(self, asset):
