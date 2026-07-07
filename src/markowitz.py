@@ -462,7 +462,49 @@ class DynamicFactorNeutralMarkowitz:
             index=self.assets_,
             columns=self.assets_
         )
+    def get_variance_series(self, asset):
+    i = self.assets_.index(asset)
 
+    return pd.Series(
+        {
+            date: Sigma[i, i]
+            for date, Sigma in self.sigmas_.items()
+        },
+        name=f"variance_{asset}"
+    ).sort_index()
+
+
+    def get_volatility_series(self, asset):
+        return np.sqrt(
+            self.get_variance_series(asset)
+        ).rename(f"volatility_{asset}")
+
+
+    def get_covariance_series(self, asset_i, asset_j):
+        i = self.assets_.index(asset_i)
+        j = self.assets_.index(asset_j)
+
+        return pd.Series(
+            {
+                date: Sigma[i, j]
+                for date, Sigma in self.sigmas_.items()
+            },
+            name=f"covariance_{asset_i}_{asset_j}"
+        ).sort_index()
+
+
+    def get_correlation_series(self, asset_i, asset_j):
+        i = self.assets_.index(asset_i)
+        j = self.assets_.index(asset_j)
+
+        return pd.Series(
+            {
+                date: Sigma[i, j] / np.sqrt(Sigma[i, i] * Sigma[j, j])
+                for date, Sigma in self.sigmas_.items()
+            },
+            name=f"correlation_{asset_i}_{asset_j}"
+        ).sort_index()
+    
     # ======================================================
     # Plots
     # ======================================================
